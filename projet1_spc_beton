@@ -1,1 +1,278 @@
+"""
+PROJET 1 — Cartes de contrôle SPC automatisées
+Contrôle qualité béton | Résistance à la compression (MPa)
+Normes : CSA A23.1 / ASTM C39
+Auteur : [Ton nom] | BSc Mathématiques financières & Économie
+"""
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import FancyArrowPatch
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+
+# ─────────────────────────────────────────────
+# 1. SIMULATION DE DONNÉES D'ESSAIS DE BÉTON
+# ─────────────────────────────────────────────
+
+def simuler_donnees_beton(n_lots=40, n_eprouvettes=3, fc_cible=35, ecart_type=2.5):
+    """
+    Simule des données de résistance à la compression (MPa).
+    - fc_cible : résistance nominale en MPa (ex: béton 35 MPa)
+    - n_eprouvettes : cylindres testés par lot (28 jours)
+    - Introduit 3 anomalies réalistes (mauvais dosage eau/ciment)
+    """
+    donnees = []
+    for lot in range(1, n_lots + 1):
+        # Légère dérive simulée après lot 25 (changement fournisseur ciment)
+        derive = -1.5 if lot > 25 else 0
+        # Anomalies ponctuelles
+        anomalie = -8 if lot in [12, 31, 37] else 0
+        
+        resistances = np.random.normal(
+            loc=fc_cible + derive + anomalie,
+            scale=ecart_type,
+            size=n_eprouvettes
+        )
+        donnees.append({
+            'lot': lot,
+            'date': pd.Timestamp('2024-06-01') + pd.Timedelta(days=lot * 2),
+            'moy': np.mean(resistances),
+            'etendue': np.max(resistances) - np.min(resistances),
+            'ecart_type': np.std(resistances, ddof=1),
+            'min_resistance': np.min(resistances)
+        })
+    return pd.DataFrame(donnees)
+
+df = simuler_donnees_beton()
+
+# ─────────────────────────────────────────────
+# 2. CALCUL DES LIMITES DE CONTRÔLE (SPC)
+# ─────────────────────────────────────────────
+
+def calculer_limites_xbar_R(df, n=3):
+    """
+    Cartes X̄-R selon constantes SPC (n=3 cylindres/lot).
+    Constantes : A2=1.023, D3=0, D4=2.574 pour n=3
+    """
+    A2, D3, D4 = 1.023, 0, 2.574  # n=3
+    
+    # Exclure les anomalies pour calculer les limites de base
+    df_base = df[(df['lot'] <= 20)]  # Phase I : 20 premiers lots stables
+    
+    X_bar_bar = df_base['moy'].mean()
+    R_bar = df_base['etendue'].mean()
+    
+    # Carte X̄
+    UCL_x = X_bar_bar + A2 * R_bar
+    LCL_x = X_bar_bar - A2 * R_bar
+    
+    # Carte R
+    UCL_r = D4 * R_bar
+    LCL_r = D3 * R_bar  # = 0 pour n=3
+    
+    return {
+        'X_bar_bar': X_bar_bar,
+        'R_bar': R_bar,
+        'UCL_x': UCL_x,
+        'LCL_x': LCL_x,
+        'UCL_r': UCL_r,
+        'LCL_r': LCL_r,
+        'fc_min_CSA': 0.85 * 35  # CSA A23.1: min individuel = 0.85 * f'c
+    }
+
+limites = calculer_limites_xbar_R(df)
+
+# ─────────────────────────────────────────────
+# 3. DÉTECTION AUTOMATIQUE DES VIOLATIONS
+# ─────────────────────────────────────────────
+
+def detecter_violations(df, limites):
+    """
+    Règles de Nelson / Western Electric :
+    Règle 1 : Point hors limites ±3σ
+    Règle 2 : 8 points consécutifs du même côté de la moyenne
+    Règle 3 : 6 points consécutifs monotones (dérive)
+    """
+    violations = pd.DataFrame({'lot': df['lot']})
+    
+    # Règle 1 — hors limites
+    violations['hors_limites'] = (
+        (df['moy'] > limites['UCL_x']) | (df['moy'] < limites['LCL_x'])
+    )
+    
+    # Règle 2 — 8 points du même côté
+    au_dessus = (df['moy'] > limites['X_bar_bar']).astype(int)
+    en_dessous = (df['moy'] < limites['X_bar_bar']).astype(int)
+    violations['derive_8pts'] = False
+    for i in range(7, len(df)):
+        if au_dessus.iloc[i-7:i+1].sum() == 8 or en_dessous.iloc[i-7:i+1].sum() == 8:
+            violations.loc[violations.index[i], 'derive_8pts'] = True
+    
+    # Règle 3 — dérive monotone 6 points
+    violations['tendance'] = False
+    for i in range(5, len(df)):
+        segment = df['moy'].iloc[i-5:i+1].values
+        if all(np.diff(segment) > 0) or all(np.diff(segment) < 0):
+            violations.loc[violations.index[i], 'tendance'] = True
+    
+    # Conformité CSA : résistance min individuelle
+    violations['non_conforme_CSA'] = df['min_resistance'] < limites['fc_min_CSA']
+    
+    return violations
+
+violations = detecter_violations(df, limites)
+df = df.merge(violations, on='lot')
+
+# ─────────────────────────────────────────────
+# 4. VISUALISATION — TABLEAU DE BORD SPC
+# ─────────────────────────────────────────────
+
+fig = plt.figure(figsize=(16, 12), facecolor='#0d1117')
+fig.suptitle('CONTRÔLE STATISTIQUE DE PROCÉDÉ — BÉTON 35 MPa\n'
+             'Résistance à la compression | CSA A23.1-19 / ASTM C39',
+             fontsize=14, fontweight='bold', color='white', y=0.98)
+
+gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.3)
+
+couleur_fond = '#161b22'
+couleur_grille = '#30363d'
+couleur_texte = '#e6edf3'
+couleur_vert = '#3fb950'
+couleur_rouge = '#f85149'
+couleur_jaune = '#d29922'
+couleur_bleu = '#58a6ff'
+
+def styler_axes(ax, titre):
+    ax.set_facecolor(couleur_fond)
+    ax.spines['bottom'].set_color(couleur_grille)
+    ax.spines['left'].set_color(couleur_grille)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.tick_params(colors=couleur_texte, labelsize=9)
+    ax.set_title(titre, color=couleur_texte, fontsize=11, fontweight='bold', pad=10)
+    ax.grid(True, color=couleur_grille, alpha=0.5, linestyle='--', linewidth=0.5)
+
+# ── Carte X̄ ────────────────────────────────
+ax1 = fig.add_subplot(gs[0, :])
+styler_axes(ax1, 'Carte X̄  —  Moyenne des résistances par lot (MPa)')
+
+ax1.plot(df['lot'], df['moy'], color=couleur_bleu, linewidth=1.5,
+         marker='o', markersize=4, zorder=3, label='Moyenne lot')
+
+# Lignes de contrôle
+ax1.axhline(limites['UCL_x'], color=couleur_rouge, linewidth=1.2,
+            linestyle='--', label=f"UCL = {limites['UCL_x']:.2f} MPa")
+ax1.axhline(limites['X_bar_bar'], color=couleur_vert, linewidth=1.5,
+            linestyle='-', label=f"X̄ = {limites['X_bar_bar']:.2f} MPa")
+ax1.axhline(limites['LCL_x'], color=couleur_rouge, linewidth=1.2,
+            linestyle='--', label=f"LCL = {limites['LCL_x']:.2f} MPa")
+ax1.axhline(limites['fc_min_CSA'], color=couleur_jaune, linewidth=1,
+            linestyle=':', label=f"Min CSA = {limites['fc_min_CSA']:.1f} MPa")
+
+# Zones ±1σ et ±2σ
+sigma = (limites['UCL_x'] - limites['X_bar_bar']) / 3
+ax1.axhspan(limites['X_bar_bar'] - sigma, limites['X_bar_bar'] + sigma,
+            alpha=0.08, color=couleur_vert)
+ax1.axhspan(limites['X_bar_bar'] + sigma, limites['X_bar_bar'] + 2*sigma,
+            alpha=0.05, color=couleur_jaune)
+ax1.axhspan(limites['X_bar_bar'] - 2*sigma, limites['X_bar_bar'] - sigma,
+            alpha=0.05, color=couleur_jaune)
+
+# Points hors limites en rouge
+hors = df[df['hors_limites']]
+ax1.scatter(hors['lot'], hors['moy'], color=couleur_rouge, s=80, zorder=5,
+            marker='X', label=f'Hors limites ({len(hors)} pts)')
+
+# Annotation dérive
+ax1.axvspan(25, 40, alpha=0.07, color=couleur_rouge,
+            label='Changement fournisseur ciment (lot 25)')
+
+ax1.set_xlabel('Numéro de lot', color=couleur_texte, fontsize=9)
+ax1.set_ylabel('Résistance moyenne (MPa)', color=couleur_texte, fontsize=9)
+legend = ax1.legend(loc='lower left', fontsize=8, facecolor=couleur_fond,
+                    edgecolor=couleur_grille, labelcolor=couleur_texte, ncol=3)
+
+# ── Carte R ────────────────────────────────
+ax2 = fig.add_subplot(gs[1, 0])
+styler_axes(ax2, 'Carte R  —  Étendue par lot')
+
+ax2.plot(df['lot'], df['etendue'], color='#a5d6ff', linewidth=1.5,
+         marker='s', markersize=3)
+ax2.axhline(limites['UCL_r'], color=couleur_rouge, linewidth=1.2, linestyle='--',
+            label=f"UCL_R = {limites['UCL_r']:.2f}")
+ax2.axhline(limites['R_bar'], color=couleur_vert, linewidth=1.2,
+            label=f"R̄ = {limites['R_bar']:.2f}")
+ax2.set_xlabel('Numéro de lot', color=couleur_texte, fontsize=9)
+ax2.set_ylabel('Étendue (MPa)', color=couleur_texte, fontsize=9)
+ax2.legend(fontsize=8, facecolor=couleur_fond, edgecolor=couleur_grille,
+           labelcolor=couleur_texte)
+
+# ── Histogramme + courbe normale ────────────
+ax3 = fig.add_subplot(gs[1, 1])
+styler_axes(ax3, 'Distribution des résistances')
+
+mu, sigma_obs = df['moy'].mean(), df['moy'].std()
+ax3.hist(df['moy'], bins=12, color=couleur_bleu, alpha=0.7, edgecolor='white',
+         linewidth=0.5, density=True)
+x_range = np.linspace(df['moy'].min() - 1, df['moy'].max() + 1, 200)
+ax3.plot(x_range, stats.norm.pdf(x_range, mu, sigma_obs),
+         color=couleur_vert, linewidth=2, label=f'N({mu:.1f}, {sigma_obs:.2f}²)')
+ax3.axvline(limites['fc_min_CSA'], color=couleur_jaune, linestyle=':',
+            linewidth=1.5, label='Min CSA')
+ax3.set_xlabel('Résistance (MPa)', color=couleur_texte, fontsize=9)
+ax3.set_ylabel('Densité', color=couleur_texte, fontsize=9)
+ax3.legend(fontsize=8, facecolor=couleur_fond, edgecolor=couleur_grille,
+           labelcolor=couleur_texte)
+
+# ── Tableau de résumé ────────────────────────
+ax4 = fig.add_subplot(gs[2, :])
+ax4.set_facecolor(couleur_fond)
+ax4.axis('off')
+ax4.set_title('RAPPORT AUTOMATIQUE — INDICATEURS DE PERFORMANCE',
+              color=couleur_texte, fontsize=11, fontweight='bold', pad=10)
+
+# Calcul des indicateurs de capabilité
+cp = (limites['UCL_x'] - limites['LCL_x']) / (6 * df['moy'].std())
+cpk = min(
+    (limites['UCL_x'] - df['moy'].mean()) / (3 * df['moy'].std()),
+    (df['moy'].mean() - limites['LCL_x']) / (3 * df['moy'].std())
+)
+taux_conformite = (1 - df['hors_limites'].mean()) * 100
+n_violations = df['hors_limites'].sum() + df['derive_8pts'].sum()
+
+indicateurs = [
+    ['Indicateur', 'Valeur', 'Cible', 'Statut'],
+    ['Cp  (capabilité potentielle)', f'{cp:.3f}', '≥ 1.33', '✓ OK' if cp >= 1.33 else '⚠ Insuffisant'],
+    ['Cpk (capabilité réelle)', f'{cpk:.3f}', '≥ 1.33', '✓ OK' if cpk >= 1.33 else '⚠ Insuffisant'],
+    ['Taux de conformité lots', f'{taux_conformite:.1f}%', '≥ 95%', '✓ OK' if taux_conformite >= 95 else '⚠ Insuffisant'],
+    ['Violations règles Nelson', str(n_violations), '0', '✓ OK' if n_violations == 0 else f'⚠ {n_violations} détectée(s)'],
+    ['X̄ global (MPa)', f"{df['moy'].mean():.2f}", f'≥ {limites["X_bar_bar"]:.1f}', '✓'],
+    ['σ observé (MPa)', f"{df['moy'].std():.3f}", '≤ 2.50', '✓ OK' if df['moy'].std() <= 2.5 else '⚠'],
+]
+
+for i, row in enumerate(indicateurs):
+    for j, val in enumerate(row):
+        color = couleur_texte
+        if i == 0:
+            color = '#58a6ff'
+        elif '⚠' in str(val):
+            color = couleur_jaune
+        elif '✓' in str(val):
+            color = couleur_vert
+        ax4.text(0.02 + j * 0.24, 1 - i * 0.16, val,
+                 transform=ax4.transAxes,
+                 color=color, fontsize=10,
+                 fontweight='bold' if i == 0 else 'normal',
+                 va='top')
+
+plt.savefig('/mnt/user-data/outputs/projet1_spc_beton.png',
+            dpi=150, bbox_inches='tight', facecolor='#0d1117')
+print("✓ Projet 1 sauvegardé : projet1_spc_beton.png")
+print(f"  Cp = {cp:.3f} | Cpk = {cpk:.3f} | Conformité = {taux_conformite:.1f}%")
+print(f"  Violations détectées : {n_violations} (lots {list(df[df['hors_limites']]['lot'])})")
