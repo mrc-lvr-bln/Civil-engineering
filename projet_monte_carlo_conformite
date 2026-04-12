@@ -1,0 +1,278 @@
+"""
+PROJET - Simulation Monte Carlo : Probabilité de Conformité CSA A23.1
+========================================================================
+Contexte : Estimer la probabilité qu'un lot de béton respecte les critères
+           de la norme CSA A23.1-19 selon la variabilité du fournisseur.
+
+Critère CSA : Sur 3 cylindres consécutifs, la moyenne doit être ≥ f'c
+              ET aucun cylindre individuel < f'c - 3.5 MPa
+
+CV Keywords : Monte Carlo, simulation stochastique, Python, NumPy, SciPy,
+              analyse de risque, optimisation de processus
+
+Compétences démontrées :
+  - Simulation Monte Carlo (50 000 itérations)
+  - Analyse de sensibilité (tornado chart)
+  - Optimisation : trouver le f'c cible pour 99% de conformité
+  - Visualisation professionnelle
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import stats
+from scipy.optimize import brentq
+
+np.random.seed(2024)
+
+# ─────────────────────────────────────────────
+# 1. CRITÈRES CSA A23.1
+# ─────────────────────────────────────────────
+
+def verifier_conformite_csa(echantillons, f_prime_c):
+    """
+    Critères CSA A23.1-19 Section 4.3 :
+    - Moyenne de 3 cylindres consécutifs >= f'c
+    - Aucun cylindre individuel < f'c - 3.5 MPa
+    """
+    conforme_moy    = np.mean(echantillons) >= f_prime_c
+    conforme_indiv  = np.all(echantillons   >= (f_prime_c - 3.5))
+    return conforme_moy and conforme_indiv
+
+
+# ─────────────────────────────────────────────
+# 2. SIMULATION MONTE CARLO PRINCIPALE
+# ─────────────────────────────────────────────
+
+def simulation_monte_carlo(f_prime_c=25.0, mu_beton=28.0, sigma_beton=3.0,
+                            n_simulations=50_000, n_cylindres=3):
+    """
+    Simule n_simulations lots de béton et calcule la probabilité de conformité.
+    Le béton est commandé avec une résistance nominale (mu_beton) >= f'c
+    pour absorber la variabilité naturelle.
+    """
+    resultats = []
+
+    # Simulation vectorisée (rapide)
+    echantillons = np.random.normal(mu_beton, sigma_beton,
+                                    size=(n_simulations, n_cylindres))
+
+    for i in range(n_simulations):
+        conforme = verifier_conformite_csa(echantillons[i], f_prime_c)
+        resultats.append({
+            'simulation':  i + 1,
+            'moyenne':     np.mean(echantillons[i]),
+            'minimum':     np.min(echantillons[i]),
+            'conforme':    conforme
+        })
+
+    df = pd.DataFrame(resultats)
+    prob_conf = df['conforme'].mean() * 100
+    return df, prob_conf
+
+
+# ─────────────────────────────────────────────
+# 3. ANALYSE DE SENSIBILITÉ (Tornado Chart)
+# ─────────────────────────────────────────────
+
+def analyse_sensibilite(f_prime_c=25.0, n_sim=20_000):
+    """
+    Fait varier chaque paramètre ±20% et mesure l'impact sur la conformité.
+    """
+    params_base = {'mu_beton': 28.0, 'sigma_beton': 3.0}
+    resultats_sens = {}
+
+    for param, val_base in params_base.items():
+        for facteur, label in [(0.80, 'Bas (-20%)'), (1.20, 'Haut (+20%)')]:
+            params = params_base.copy()
+            params[param] = val_base * facteur
+            _, prob = simulation_monte_carlo(f_prime_c=f_prime_c, n_simulations=n_sim,
+                                             **params)
+            if param not in resultats_sens:
+                resultats_sens[param] = {}
+            resultats_sens[param][label] = prob
+
+    return resultats_sens
+
+
+# ─────────────────────────────────────────────
+# 4. OPTIMISATION : f'c cible pour 99% conformité
+# ─────────────────────────────────────────────
+
+def trouver_mu_cible(f_prime_c=25.0, sigma=3.0, cible_conformite=0.99, n_sim=30_000):
+    """
+    Cherche la résistance moyenne de commande (mu) pour atteindre
+    une probabilité de conformité cible (ex: 99%).
+    """
+    def ecart_conformite(mu):
+        _, prob = simulation_monte_carlo(f_prime_c=f_prime_c, mu_beton=mu,
+                                         sigma_beton=sigma, n_simulations=n_sim)
+        return (prob / 100) - cible_conformite
+
+    mu_opt = brentq(ecart_conformite, f_prime_c, f_prime_c + 12, xtol=0.1)
+    return mu_opt
+
+
+# ─────────────────────────────────────────────
+# 5. COURBE RISQUE vs mu_beton (différents σ)
+# ─────────────────────────────────────────────
+
+def courbe_risque(f_prime_c=25.0, n_sim=15_000):
+    """Calcule P(conformité) pour plusieurs valeurs de mu et σ."""
+    mus    = np.arange(f_prime_c, f_prime_c + 10, 0.5)
+    sigmas = [1.5, 2.5, 3.5, 4.5]
+    resultats = {}
+
+    for sigma in sigmas:
+        probs = []
+        for mu in mus:
+            _, prob = simulation_monte_carlo(f_prime_c=f_prime_c, mu_beton=mu,
+                                             sigma_beton=sigma, n_simulations=n_sim)
+            probs.append(prob)
+        resultats[f'σ = {sigma} MPa'] = probs
+
+    return mus, resultats
+
+
+# ─────────────────────────────────────────────
+# 6. VISUALISATION COMPLÈTE
+# ─────────────────────────────────────────────
+
+def tracer_rapport_mc(df_mc, prob_conf, sens, mus, courbes, mu_opt):
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor('#F8F9FA')
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.40, wspace=0.38)
+
+    fig.suptitle('Simulation Monte Carlo – Conformité CSA A23.1-19\n'
+                 f'f\'c = 25 MPa | μ = 28 MPa | σ = 3 MPa | N = 50 000 simulations',
+                 fontsize=13, fontweight='bold', y=0.98)
+
+    couleurs_sigma = ['#43A047', '#2196F3', '#FF9800', '#F44336']
+
+    # ── Panneau 1 : Distribution des moyennes simulées ──
+    ax1 = fig.add_subplot(gs[0, :2])
+    conf   = df_mc[df_mc['conforme'] == True]['moyenne']
+    nonconf = df_mc[df_mc['conforme'] == False]['moyenne']
+
+    ax1.hist(conf,    bins=80, color='#43A047', alpha=0.65, label=f'Conforme ({len(conf):,})', density=True)
+    ax1.hist(nonconf, bins=80, color='#F44336', alpha=0.75, label=f'Non conforme ({len(nonconf):,})', density=True)
+    ax1.axvline(25.0, color='#7B1FA2', linestyle='--', linewidth=2, label='f\'c = 25 MPa')
+    ax1.axvline(df_mc['moyenne'].mean(), color='#212121', linestyle='-',
+                linewidth=1.5, label=f'μ simulé = {df_mc["moyenne"].mean():.2f} MPa')
+
+    ax1.set_title('Distribution des moyennes simulées (50 000 lots)', fontweight='bold')
+    ax1.set_xlabel('Résistance moyenne du lot (MPa)')
+    ax1.set_ylabel('Densité de probabilité')
+    ax1.legend(fontsize=9)
+    ax1.set_facecolor('white')
+    ax1.grid(True, alpha=0.3, linestyle=':')
+
+    # Annotation probabilité
+    ax1.text(0.02, 0.92, f'P(conformité CSA) = {prob_conf:.2f}%',
+             transform=ax1.transAxes, fontsize=13, fontweight='bold',
+             color='#1565C0',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#E3F2FD', edgecolor='#1565C0'))
+
+    # ── Panneau 2 : Compteur probabilité ──
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.axis('off')
+    couleur_prob = '#43A047' if prob_conf >= 95 else '#FF9800' if prob_conf >= 85 else '#F44336'
+
+    ax2.text(0.5, 0.75, f'{prob_conf:.1f}%', transform=ax2.transAxes,
+             fontsize=38, fontweight='bold', ha='center', va='center',
+             color=couleur_prob)
+    ax2.text(0.5, 0.52, 'Probabilité de conformité', transform=ax2.transAxes,
+             fontsize=11, ha='center', color='#424242')
+    ax2.text(0.5, 0.40, 'CSA A23.1-19', transform=ax2.transAxes,
+             fontsize=10, ha='center', color='#757575')
+
+    statut = '✓ ACCEPTABLE' if prob_conf >= 90 else '⚠ INSUFFISANT'
+    couleur_statut = '#43A047' if prob_conf >= 90 else '#F44336'
+    ax2.text(0.5, 0.22, statut, transform=ax2.transAxes,
+             fontsize=13, fontweight='bold', ha='center', color=couleur_statut)
+    ax2.text(0.5, 0.10, f'μ cible pour 99% : {mu_opt:.1f} MPa', transform=ax2.transAxes,
+             fontsize=10, ha='center', color='#5C6BC0', style='italic')
+    ax2.set_facecolor('white')
+    ax2.set_xlim(0, 1); ax2.set_ylim(0, 1)
+    for spine in ax2.spines.values():
+        spine.set_edgecolor('#E0E0E0')
+
+    # ── Panneau 3 : Courbes risque P(conf) vs mu ──
+    ax3 = fig.add_subplot(gs[1, :2])
+    for (label, probs), couleur in zip(courbes.items(), couleurs_sigma):
+        ax3.plot(mus, probs, '-o', color=couleur, linewidth=2,
+                 markersize=4, label=label)
+
+    ax3.axhline(99, color='#43A047', linestyle=':', linewidth=1.5, alpha=0.7, label='Cible 99%')
+    ax3.axhline(90, color='#FF9800', linestyle=':', linewidth=1.5, alpha=0.7, label='Min. 90%')
+    ax3.axvline(28.0, color='#212121', linestyle='--', linewidth=1.2, alpha=0.5, label='μ actuel = 28 MPa')
+    ax3.axvline(mu_opt, color='#1565C0', linestyle='--', linewidth=1.5, label=f'μ_opt = {mu_opt:.1f} MPa')
+
+    ax3.set_title('Courbes de risque : P(conformité) selon μ et σ', fontweight='bold')
+    ax3.set_xlabel('Résistance moyenne de commande μ (MPa)')
+    ax3.set_ylabel('Probabilité de conformité (%)')
+    ax3.set_ylim(0, 102)
+    ax3.legend(fontsize=8, ncol=2)
+    ax3.set_facecolor('white')
+    ax3.grid(True, alpha=0.3, linestyle=':')
+
+    # ── Panneau 4 : Tornado Chart (sensibilité) ──
+    ax4 = fig.add_subplot(gs[1, 2])
+    params_labels = {'mu_beton': 'μ béton', 'sigma_beton': 'σ béton'}
+    y_pos = np.arange(len(sens))
+    base_prob = prob_conf
+
+    for idx, (param, vals) in enumerate(sens.items()):
+        bas  = vals['Bas (-20%)']
+        haut = vals['Haut (+20%)']
+        ax4.barh(idx - 0.18, abs(haut - base_prob), left=base_prob if haut > base_prob else haut,
+                 height=0.35, color='#43A047' if haut > base_prob else '#F44336',
+                 alpha=0.8, label='+20%' if idx == 0 else '')
+        ax4.barh(idx + 0.18, abs(bas - base_prob), left=min(bas, base_prob),
+                 height=0.35, color='#F44336' if bas < base_prob else '#43A047',
+                 alpha=0.8, label='-20%' if idx == 0 else '')
+        ax4.text(base_prob + 0.8, idx - 0.18, f'{haut:.1f}%', va='center', fontsize=8)
+        ax4.text(base_prob + 0.8, idx + 0.18, f'{bas:.1f}%',  va='center', fontsize=8)
+
+    ax4.axvline(base_prob, color='#212121', linestyle='--', linewidth=1.5,
+                label=f'Base = {base_prob:.1f}%')
+    ax4.set_yticks(y_pos)
+    ax4.set_yticklabels([params_labels[p] for p in sens.keys()], fontsize=10)
+    ax4.set_title('Analyse de sensibilité (Tornado)', fontweight='bold')
+    ax4.set_xlabel('P(conformité) %')
+    ax4.legend(fontsize=8)
+    ax4.set_facecolor('white')
+    ax4.grid(True, alpha=0.3, linestyle=':', axis='x')
+
+    plt.savefig('/mnt/user-data/outputs/projet2_monte_carlo.png',
+                dpi=150, bbox_inches='tight', facecolor='#F8F9FA')
+    plt.close()
+    print("✅ Projet 2 sauvegardé : projet2_monte_carlo.png")
+
+
+# ─────────────────────────────────────────────
+# EXÉCUTION
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    print("⏳ Simulation Monte Carlo en cours (50 000 itérations)...")
+    df_mc, prob_conf = simulation_monte_carlo(n_simulations=50_000)
+
+    print("⏳ Analyse de sensibilité...")
+    sens = analyse_sensibilite()
+
+    print("⏳ Optimisation de la résistance cible...")
+    mu_opt = trouver_mu_cible()
+
+    print("⏳ Courbes de risque...")
+    mus, courbes = courbe_risque()
+
+    print(f"\n{'='*55}")
+    print(f"  MONTE CARLO – CONFORMITÉ CSA A23.1")
+    print(f"{'='*55}")
+    print(f"  P(conformité)       : {prob_conf:.2f}%")
+    print(f"  μ optimal (99%)     : {mu_opt:.2f} MPa")
+    print(f"  Sur-résistance req. : +{mu_opt - 25:.2f} MPa au-dessus de f'c")
+    print(f"{'='*55}\n")
+
+    tracer_rapport_mc(df_mc, prob_conf, sens, mus, courbes, mu_opt)
