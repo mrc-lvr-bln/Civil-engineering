@@ -1,0 +1,311 @@
+"""
+PROJET - Optimisation du Plan d'Échantillonnage par Simulation Stochastique
+==============================================================================
+Contexte : Trouver la fréquence d'échantillonnage optimale qui minimise le
+           coût total (coût d'essai + coût de non-conformité passée inaperçue)
+           — pont entre les maths financières (optimisation, espérance) et génie civil
+
+CV Keywords : Optimisation stochastique, analyse coût-bénéfice, Python,
+              SciPy, simulation, prise de décision sous incertitude
+
+Compétences démontrées :
+  - Modélisation économique (coût d'espérance)
+  - Simulation stochastique du processus de production
+  - Optimisation numérique (scipy.optimize.minimize_scalar)
+  - Surface de réponse 2D
+  - Visualisation de la frontière Pareto (qualité vs coût)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.optimize import minimize_scalar
+from scipy.stats import norm
+
+np.random.seed(2024)
+
+# ─────────────────────────────────────────────
+# 1. PARAMÈTRES DU MODÈLE ÉCONOMIQUE
+# ─────────────────────────────────────────────
+
+# Coûts unitaires (CAD)
+COUT_ESSAI_COMPRESSION    = 75    # $/cylindre (ASTM C39)
+COUT_ESSAI_GRANULO        = 120   # $/échantillon granulométrie
+COUT_REPARATION_MINOR     = 8_000    # Reprise d'une section non conforme
+COUT_REPARATION_MAJEUR    = 45_000   # Démolition + reconstruction
+COUT_DEFAILLANCE_SERVICE  = 250_000  # Sinistre / perte de garantie
+
+# Paramètres du béton (distribution de résistance)
+F_PRIME_C = 25.0   # MPa (requis)
+MU_BETON  = 28.0   # MPa (commandé)
+SIGMA     = 3.0    # MPa (variabilité fournisseur)
+
+# Volume de production
+VOLUME_BETON_M3_PAR_JOUR = 50   # m³/jour de béton coulé
+JOURS_CHANTIER           = 60   # durée du projet
+
+
+# ─────────────────────────────────────────────
+# 2. MODÈLE DE SIMULATION DU CHANTIER
+# ─────────────────────────────────────────────
+
+def simuler_chantier(freq_essais_par_m3, n_simulations=5_000):
+    """
+    freq_essais_par_m3 : 1 essai par X m³ de béton
+    Retourne le coût total espéré par simulation.
+    """
+    couts_totaux = []
+
+    volume_total = VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER  # m³
+    n_essais     = int(volume_total / freq_essais_par_m3)
+    cout_essais  = n_essais * COUT_ESSAI_COMPRESSION * 3      # 3 cylindres/essai
+
+    # Volume de béton entre deux essais (zone aveugle)
+    volume_zone_aveugle = freq_essais_par_m3  # m³
+
+    for _ in range(n_simulations):
+        cout_sim = cout_essais  # coût fixe des essais
+
+        # Simuler chaque "zone" entre essais
+        for essai in range(n_essais):
+            # Résistance réelle du béton (avec dérive possible aléatoire)
+            derive_soudaine = np.random.exponential(scale=0.02)  # dérive rare
+            mu_reel = MU_BETON - (derive_soudaine * 20 if np.random.random() < 0.05 else 0)
+
+            resistance = np.random.normal(mu_reel, SIGMA)
+
+            if resistance < F_PRIME_C:
+                # Béton non conforme dans cette zone
+                if resistance < F_PRIME_C - 5:  # grave
+                    cout_sim += COUT_REPARATION_MAJEUR * (volume_zone_aveugle / volume_total)
+                else:  # mineur
+                    cout_sim += COUT_REPARATION_MINOR  * (volume_zone_aveugle / volume_total)
+
+                # Risque de défaillance en service si non détecté (proportionnel à la zone aveugle)
+                prob_defaillance = 0.02 * (freq_essais_par_m3 / 100)
+                if np.random.random() < prob_defaillance:
+                    cout_sim += COUT_DEFAILLANCE_SERVICE
+
+        couts_totaux.append(cout_sim)
+
+    return np.array(couts_totaux)
+
+
+# ─────────────────────────────────────────────
+# 3. COURBE DE COÛT TOTAL EN FONCTION DE LA FRÉQUENCE
+# ─────────────────────────────────────────────
+
+def analyser_frequences(freqs, n_simulations=5_000):
+    """Calcule coût moyen, Q10, Q90 pour chaque fréquence testée."""
+    resultats = []
+    for freq in freqs:
+        couts = simuler_chantier(freq, n_simulations)
+        n_essais = int((VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER) / freq)
+        resultats.append({
+            'freq_m3':      freq,
+            'n_essais':     n_essais,
+            'cout_moyen':   np.mean(couts),
+            'cout_q10':     np.percentile(couts, 10),
+            'cout_q90':     np.percentile(couts, 90),
+            'cout_min':     np.min(couts),
+            'cout_max':     np.max(couts),
+        })
+    return pd.DataFrame(resultats)
+
+
+# ─────────────────────────────────────────────
+# 4. OPTIMISATION NUMÉRIQUE
+# ─────────────────────────────────────────────
+
+def trouver_freq_optimale(n_simulations=3_000):
+    """Minimise le coût espéré par optimisation scalaire."""
+    def cout_esperance(freq):
+        couts = simuler_chantier(freq, n_simulations)
+        return np.mean(couts)
+
+    result = minimize_scalar(cout_esperance, bounds=(10, 200), method='bounded',
+                             options={'xatol': 5.0})
+    return result.x, result.fun
+
+
+# ─────────────────────────────────────────────
+# 5. SURFACE DE RÉPONSE : coût = f(freq, sigma)
+# ─────────────────────────────────────────────
+
+def surface_reponse(freqs_grid, sigmas_grid, n_simulations=2_000):
+    """Calcule la surface de coût 2D en faisant varier freq et sigma."""
+    Z = np.zeros((len(sigmas_grid), len(freqs_grid)))
+    global SIGMA
+    sigma_base = SIGMA
+
+    for i, sigma in enumerate(sigmas_grid):
+        SIGMA = sigma
+        for j, freq in enumerate(freqs_grid):
+            couts = simuler_chantier(freq, n_simulations)
+            Z[i, j] = np.mean(couts)
+
+    SIGMA = sigma_base
+    return Z
+
+
+# ─────────────────────────────────────────────
+# 6. VISUALISATION COMPLÈTE
+# ─────────────────────────────────────────────
+
+def tracer_rapport_optimisation(df_freqs, freq_opt, cout_opt):
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor('#F8F9FA')
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.38)
+
+    fig.suptitle('Optimisation du Plan d\'Échantillonnage – Analyse Coût-Risque\n'
+                 f'Chantier : {VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER:,} m³ béton | f\'c = {F_PRIME_C} MPa | σ = {SIGMA} MPa',
+                 fontsize=13, fontweight='bold', y=0.98)
+
+    # ── Panneau 1 : Courbe coût total avec intervalles ──
+    ax1 = fig.add_subplot(gs[0, :2])
+
+    ax1.fill_between(df_freqs['freq_m3'], df_freqs['cout_q10'] / 1000, df_freqs['cout_q90'] / 1000,
+                     alpha=0.2, color='#2196F3', label='Intervalle Q10-Q90')
+    ax1.plot(df_freqs['freq_m3'], df_freqs['cout_moyen'] / 1000, 'o-',
+             color='#1565C0', linewidth=2.5, markersize=6, label='Coût espéré moyen')
+
+    # Coûts composantes
+    cout_essais_seuls = [(VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER / f) * COUT_ESSAI_COMPRESSION * 3 / 1000
+                         for f in df_freqs['freq_m3']]
+    ax1.plot(df_freqs['freq_m3'], cout_essais_seuls, '--',
+             color='#43A047', linewidth=1.5, label='Coût des essais seulement')
+
+    ax1.axvline(freq_opt, color='#F44336', linestyle='--', linewidth=2,
+                label=f'Fréquence optimale : 1/{freq_opt:.0f} m³')
+    ax1.plot(freq_opt, cout_opt / 1000, '*', color='#F44336', markersize=15, zorder=5)
+    ax1.annotate(f'  Opt: 1/{freq_opt:.0f} m³\n  ${cout_opt/1000:.1f}k',
+                 xy=(freq_opt, cout_opt/1000), fontsize=10, color='#C62828', fontweight='bold')
+
+    ax1.set_title('Coût total espéré vs fréquence d\'échantillonnage', fontweight='bold')
+    ax1.set_xlabel('Fréquence : 1 essai par X m³')
+    ax1.set_ylabel('Coût total ($k CAD)')
+    ax1.legend(fontsize=9)
+    ax1.set_facecolor('white')
+    ax1.grid(True, alpha=0.3, linestyle=':')
+
+    # ── Panneau 2 : Tableau recommandation ──
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.axis('off')
+
+    scenarios = [
+        ('Agressif\n(sur-échantillon)', 25,  '#1565C0'),
+        (f'Optimal\n(1/{freq_opt:.0f} m³)',    freq_opt, '#43A047'),
+        ('Minimal\n(sous-échantillon)', 150, '#F44336'),
+    ]
+
+    y_offsets = [0.80, 0.52, 0.24]
+    for (label, freq, couleur), y in zip(scenarios, y_offsets):
+        couts = simuler_chantier(freq, n_simulations=2_000)
+        c_moy = np.mean(couts)
+        n_ess = int((VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER) / freq)
+
+        rect = plt.Rectangle((0.05, y - 0.12), 0.9, 0.24,
+                              transform=ax2.transAxes, linewidth=1.5,
+                              edgecolor=couleur, facecolor=couleur + '22')
+        ax2.add_patch(rect)
+        ax2.text(0.5, y + 0.06, label, transform=ax2.transAxes,
+                 ha='center', fontsize=10, fontweight='bold', color=couleur)
+        ax2.text(0.5, y - 0.02, f'{n_ess} essais | ${c_moy/1000:.0f}k espéré',
+                 transform=ax2.transAxes, ha='center', fontsize=9, color='#424242')
+
+    ax2.set_title('Comparaison de scénarios', fontweight='bold', pad=10)
+    ax2.set_facecolor('white')
+    for s in ax2.spines.values():
+        s.set_edgecolor('#E0E0E0')
+
+    # ── Panneau 3 : Distribution des coûts au point optimal ──
+    ax3 = fig.add_subplot(gs[1, 0])
+    couts_opt = simuler_chantier(freq_opt, n_simulations=5_000)
+    ax3.hist(couts_opt / 1000, bins=50, color='#1565C0', alpha=0.7,
+             edgecolor='white', density=True)
+    ax3.axvline(np.mean(couts_opt) / 1000, color='#43A047', linestyle='--',
+                linewidth=2, label=f'Moyenne = ${np.mean(couts_opt)/1000:.0f}k')
+    ax3.axvline(np.percentile(couts_opt, 95) / 1000, color='#F44336', linestyle='--',
+                linewidth=2, label=f'P95 = ${np.percentile(couts_opt, 95)/1000:.0f}k')
+    ax3.set_title(f'Distribution des coûts\n(fréquence optimale 1/{freq_opt:.0f} m³)', fontweight='bold')
+    ax3.set_xlabel('Coût total ($k CAD)')
+    ax3.set_ylabel('Densité')
+    ax3.legend(fontsize=9)
+    ax3.set_facecolor('white')
+    ax3.grid(True, alpha=0.3, linestyle=':')
+
+    # ── Panneau 4 : Surface de réponse (freq vs sigma) ──
+    ax4 = fig.add_subplot(gs[1, 1])
+    freqs_g  = np.array([25, 50, 75, 100, 125, 150])
+    sigmas_g = np.array([1.5, 2.5, 3.5, 4.5])
+
+    print("  Calcul surface de réponse...")
+    Z = surface_reponse(freqs_g, sigmas_g, n_simulations=1_000)
+
+    im = ax4.contourf(freqs_g, sigmas_g, Z / 1000, levels=15, cmap='RdYlGn_r')
+    ax4.contour(freqs_g, sigmas_g, Z / 1000, levels=8, colors='white', linewidths=0.5, alpha=0.5)
+    plt.colorbar(im, ax=ax4, label='Coût total ($k CAD)', shrink=0.8)
+    ax4.set_title('Surface de réponse : coût\nen fonction de σ et fréquence', fontweight='bold')
+    ax4.set_xlabel('Fréquence (1 essai par X m³)')
+    ax4.set_ylabel('Écart-type σ (MPa)')
+    ax4.plot(freq_opt, SIGMA, 'w*', markersize=14, label='Optimum')
+    ax4.legend(fontsize=9)
+    ax4.set_facecolor('white')
+
+    # ── Panneau 5 : ROI par essai additionnel ──
+    ax5 = fig.add_subplot(gs[1, 2])
+    freqs_roi = df_freqs['freq_m3'].values
+    couts_roi = df_freqs['cout_moyen'].values
+
+    # Dérivée numérique : économie marginale par essai supplémentaire
+    delta_cout = -np.diff(couts_roi)
+    n_essais_diff = np.diff(df_freqs['n_essais'].values)
+    roi_marginal = np.where(n_essais_diff != 0, delta_cout / n_essais_diff, 0)
+
+    freqs_mid = (freqs_roi[:-1] + freqs_roi[1:]) / 2
+    couleurs_roi = ['#43A047' if r > COUT_ESSAI_COMPRESSION * 3 else '#F44336' for r in roi_marginal]
+
+    ax5.bar(range(len(roi_marginal)), roi_marginal, color=couleurs_roi,
+            alpha=0.8, edgecolor='white')
+    ax5.axhline(COUT_ESSAI_COMPRESSION * 3, color='#1565C0', linestyle='--',
+                linewidth=1.5, label=f'Coût d\'1 essai = ${COUT_ESSAI_COMPRESSION*3}')
+    ax5.axhline(0, color='#212121', linewidth=0.8)
+    ax5.set_title('Économie marginale\npar essai additionnel ($)', fontweight='bold')
+    ax5.set_xlabel('Palier de fréquence')
+    ax5.set_ylabel('Économie ($ / essai)')
+    ax5.legend(fontsize=8)
+    ax5.set_facecolor('white')
+    ax5.grid(True, alpha=0.3, linestyle=':', axis='y')
+
+    plt.savefig('/mnt/user-data/outputs/projet3_optimisation_echantillonnage.png',
+                dpi=150, bbox_inches='tight', facecolor='#F8F9FA')
+    plt.close()
+
+# ─────────────────────────────────────────────
+# EXÉCUTION
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    freqs_test = [25, 40, 50, 60, 75, 100, 125, 150]
+
+    print("⏳ Analyse des fréquences d'échantillonnage...")
+    df_freqs = analyser_frequences(freqs_test, n_simulations=3_000)
+
+    print("⏳ Optimisation numérique...")
+    freq_opt, cout_opt = trouver_freq_optimale(n_simulations=2_000)
+
+    print(f"\n{'='*55}")
+    print(f"  OPTIMISATION – PLAN D'ÉCHANTILLONNAGE")
+    print(f"{'='*55}")
+    print(f"  Volume total         : {VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER:,} m³")
+    print(f"  Fréquence optimale   : 1 essai / {freq_opt:.0f} m³")
+    n_ess_opt = int((VOLUME_BETON_M3_PAR_JOUR * JOURS_CHANTIER) / freq_opt)
+    print(f"  Nombre d'essais      : {n_ess_opt}")
+    print(f"  Coût espéré          : ${cout_opt:,.0f} CAD")
+    print(f"{'='*55}")
+    print("\n  Tableau comparatif des fréquences :")
+    print(df_freqs[['freq_m3','n_essais','cout_moyen','cout_q10','cout_q90']].to_string(
+        index=False, float_format=lambda x: f'{x:,.0f}'))
+    print()
+
+    tracer_rapport_optimisation(df_freqs, freq_opt, cout_opt)
