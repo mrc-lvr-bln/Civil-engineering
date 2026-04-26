@@ -288,10 +288,10 @@ def tracer_rapport_optimisation(df_freqs, freq_opt, cout_opt):
 if __name__ == '__main__':
     freqs_test = [25, 40, 50, 60, 75, 100, 125, 150]
 
-    print("⏳ Analyse des fréquences d'échantillonnage...")
+    print(" Analyse des fréquences d'échantillonnage...")
     df_freqs = analyser_frequences(freqs_test, n_simulations=3_000)
 
-    print("⏳ Optimisation numérique...")
+    print(" Optimisation numérique...")
     freq_opt, cout_opt = trouver_freq_optimale(n_simulations=2_000)
 
     print(f"\n{'='*55}")
