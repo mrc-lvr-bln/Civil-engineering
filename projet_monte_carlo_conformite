@@ -248,20 +248,20 @@ def tracer_rapport_mc(df_mc, prob_conf, sens, mus, courbes, mu_opt):
     plt.savefig('/mnt/user-data/outputs/projet2_monte_carlo.png',
                 dpi=150, bbox_inches='tight', facecolor='#F8F9FA')
     plt.close()
-    print("✅ Projet 2 sauvegardé : projet2_monte_carlo.png")
+    print(" Projet 2 sauvegardé : projet2_monte_carlo.png")
 
 
 # ─────────────────────────────────────────────
 # EXÉCUTION
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
-    print("⏳ Simulation Monte Carlo en cours (50 000 itérations)...")
+    print(" Simulation Monte Carlo en cours (50 000 itérations)...")
     df_mc, prob_conf = simulation_monte_carlo(n_simulations=50_000)
 
-    print("⏳ Analyse de sensibilité...")
+    print(" Analyse de sensibilité...")
     sens = analyse_sensibilite()
 
-    print("⏳ Optimisation de la résistance cible...")
+    print(" Optimisation de la résistance cible...")
     mu_opt = trouver_mu_cible()
 
     print("⏳ Courbes de risque...")
